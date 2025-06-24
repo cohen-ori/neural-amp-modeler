@@ -509,6 +509,23 @@ class GUI(object):
 
         self._check_button_states()
 
+        # Add dataset type dropdown
+        self.dataset_type_var = _tk.StringVar(value="default")
+        self._widgets["dataset_type_label"] = _tk.Label(self._root, text="Dataset Type:")
+        self._widgets["dataset_type_label"].pack()
+        self._widgets["dataset_type_dropdown"] = _tk.OptionMenu(
+            self._root, self.dataset_type_var, "default", "json_conditioned", command=self._on_dataset_type_change
+        )
+        self._widgets["dataset_type_dropdown"].pack()
+        # Add JSON file picker (initially disabled)
+        self.json_path_var = _tk.StringVar()
+        self._widgets["json_path_label"] = _tk.Label(self._root, text="JSON Data File:")
+        self._widgets["json_path_label"].pack()
+        self._widgets["json_path_entry"] = _tk.Entry(self._root, textvariable=self.json_path_var, state="disabled", width=50)
+        self._widgets["json_path_entry"].pack()
+        self._widgets["json_path_button"] = _tk.Button(self._root, text="Browse...", command=self._browse_json, state="disabled")
+        self._widgets["json_path_button"].pack()
+
     def core_train_kwargs(self) -> _Dict[str, _Any]:
         """
         Get any additional kwargs to provide to `core.train`
@@ -722,6 +739,9 @@ class GUI(object):
                 self.user_metadata if self.user_metadata_flag else _UserMetadata()
             )
 
+            dataset_type = self.dataset_type_var.get()
+            json_path = self.json_path_var.get() if dataset_type == "json_conditioned" else None
+
             train_output = _core.train(
                 input_path,
                 file,
@@ -738,6 +758,8 @@ class GUI(object):
                 threshold_esr=threshold_esr,
                 user_metadata=user_metadata,
                 **self.core_train_kwargs(),
+                dataset_type=dataset_type,
+                json_path=json_path,
             )
 
             if train_output.model is None:
@@ -896,6 +918,19 @@ class GUI(object):
         """
         self._disable()
         func(self._resume, *args, **kwargs)
+
+    def _on_dataset_type_change(self, value):
+        if value == "json_conditioned":
+            self._widgets["json_path_entry"].config(state="normal")
+            self._widgets["json_path_button"].config(state="normal")
+        else:
+            self._widgets["json_path_entry"].config(state="disabled")
+            self._widgets["json_path_button"].config(state="disabled")
+
+    def _browse_json(self):
+        path = _filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
+        if path:
+            self.json_path_var.set(path)
 
 
 # some typing functions

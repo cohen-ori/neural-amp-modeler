@@ -334,14 +334,15 @@ class _WaveNet(_nn.Module):
         for layer in self._layers:
             i = layer.import_weights(weights, i)
 
-    def forward(self, x: _torch.Tensor) -> _torch.Tensor:
+    def forward(self, x: _torch.Tensor, c: _torch.Tensor) -> _torch.Tensor:
         """
         :param x: (B,Cx,L)
+        :param c: (B,Cc,L)
         :return: (B,Cy,L-R)
         """
         y, head_input = x, None
         for layer in self._layers:
-            head_input, y = layer(y, x, head_input=head_input)
+            head_input, y = layer(y, c, head_input=head_input)
         head_input = self._head_scale * head_input
         return head_input if self._head is None else self._head(head_input)
 
@@ -370,9 +371,21 @@ class WaveNet(_BaseNet, _ImportsWeights):
     def _export_weights(self) -> _np.ndarray:
         return self._net.export_weights()
 
-    def _forward(self, x):
+    def _forward(self, x, c=None, ny=None):
         if x.ndim == 2:
             x = x[:, None, :]
-        y = self._net(x)
+        if c is None:
+            # Default to zeros if no condition provided
+            batch, _, length = x.shape
+            # Try to infer condition_size from the model config
+            condition_size = self._net._layers[0]._layers[0]._input_mixer.in_channels
+            c = _torch.zeros((batch, condition_size, length), dtype=x.dtype, device=x.device)
+        elif c.ndim == 2:
+            # Expand condition vector to (B, condition_size, L)
+            c = c[:, :, None].expand(-1, -1, x.shape[-1])
+        y = self._net(x, c)
         assert y.shape[1] == 1
-        return y[:, 0, :]
+        y = y[:, 0, :]
+        if ny is not None and y.shape[-1] > ny:
+            y = y[..., -ny:]
+        return y

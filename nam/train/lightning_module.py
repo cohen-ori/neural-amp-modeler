@@ -246,8 +246,12 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
                     lr_scheduler_config[key] = self._scheduler_config[key]
             return {"optimizer": optimizer, "lr_scheduler": lr_scheduler_config}
 
-    def forward(self, *args, **kwargs):
-        return self.net(*args, **kwargs)  # TODO deprecate--use self.net() instead.
+    def forward(self, x, c=None, pad_start=True, ny=None):
+        # If c is provided, pass it to the net; else, use legacy behavior
+        if c is not None:
+            return self._net(x, c, ny=ny)
+        else:
+            return self._net(x, ny=ny)
 
     def on_load_checkpoint(self, checkpoint: _Dict[str, _Any]) -> None:
         # Resolves https://github.com/sdatkinson/neural-amp-modeler/issues/351
@@ -257,26 +261,24 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         # Resolves https://github.com/sdatkinson/neural-amp-modeler/issues/351
         checkpoint["sample_rate"] = self.net.sample_rate
 
-    def _shared_step(
-        self, batch
-    ) -> _Tuple[_torch.Tensor, _torch.Tensor, _Dict[str, _LossItem]]:
+    def _shared_step(self, batch):
         """
-        B: Batch size
-        L: Sequence length
-
-        :return: (B,L), (B,L)
+        Handles both (x, y) and (x, y, c) batches.
         """
-        args, targets = batch[:-1], batch[-1]
-        preds = self(*args, pad_start=False)
-
-        # Compute all relevant losses.
-        loss_dict = {}  # Mind keys versus validation loss requested...
-        # Prediction aka MSE loss
-        if self._loss_config.fourier:
-            loss_dict["MSE_FFT"] = _LossItem(1.0, _mse_fft(preds, targets))
+        if len(batch) == 3:
+            x, y, c = batch
+            preds = self(x, c, pad_start=False, ny=y.shape[-1])
+        elif len(batch) == 2:
+            x, y = batch
+            preds = self(x, pad_start=False, ny=y.shape[-1])
         else:
-            loss_dict["MSE"] = _LossItem(1.0, self._mse_loss(preds, targets))
-        # Pre-emphasized MSE
+            raise ValueError(f'Unexpected batch size: {len(batch)}')
+        # Compute all relevant losses (as before)
+        loss_dict = {}
+        if self._loss_config.fourier:
+            loss_dict["MSE_FFT"] = _LossItem(1.0, _mse_fft(preds, y))
+        else:
+            loss_dict["MSE"] = _LossItem(1.0, self._mse_loss(preds, y))
         if self._loss_config.pre_emph_weight is not None:
             if (self._loss_config.pre_emph_coef is None) != (
                 self._loss_config.pre_emph_weight is None
@@ -285,38 +287,31 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
             loss_dict["Pre-emphasized MSE"] = _LossItem(
                 self._loss_config.pre_emph_weight,
                 self._mse_loss(
-                    preds, targets, pre_emph_coef=self._loss_config.pre_emph_coef
+                    preds, y, pre_emph_coef=self._loss_config.pre_emph_coef
                 ),
             )
-        # Multi-resolution short-time Fourier transform loss
         if self._loss_config.mrstft_weight is not None:
             loss_dict["MRSTFT"] = _LossItem(
-                self._loss_config.mrstft_weight, self._mrstft_loss(preds, targets)
+                self._loss_config.mrstft_weight, self._mrstft_loss(preds, y)
             )
-        # Pre-emphasized MRSTFT
         if self._loss_config.pre_emph_mrstft_weight is not None:
             loss_dict["Pre-emphasized MRSTFT"] = _LossItem(
                 self._loss_config.pre_emph_mrstft_weight,
                 self._mrstft_loss(
-                    preds, targets, pre_emph_coef=self._loss_config.pre_emph_mrstft_coef
+                    preds, y, pre_emph_coef=self._loss_config.pre_emph_mrstft_coef
                 ),
             )
-        # DC loss
         dc_weight = self._loss_config.dc_weight
         if dc_weight is not None and dc_weight > 0.0:
-            # Denominator could be a bad idea. I'm going to omit it esp since I'm
-            # using mini batches
             mean_dims = _torch.arange(1, preds.ndim).tolist()
             dc_loss = _nn.MSELoss()(
-                preds.mean(dim=mean_dims), targets.mean(dim=mean_dims)
+                preds.mean(dim=mean_dims), y.mean(dim=mean_dims)
             )
             loss_dict["DC MSE"] = _LossItem(dc_weight, dc_loss)
-
-        return preds, targets, loss_dict
+        return preds, y, loss_dict
 
     def training_step(self, batch, batch_idx):
         _, _, loss_dict = self._shared_step(batch)
-
         loss = 0.0
         for v in loss_dict.values():
             if v.weight is not None and v.weight > 0.0:
@@ -325,12 +320,7 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
 
     def validation_step(self, batch, batch_idx):
         preds, targets, loss_dict = self._shared_step(batch)
-
         def get_val_loss():
-            # "esr" -> "ESR"
-            # "mse" -> "MSE"
-            # Others unsupported...
-            # TODO better mapping from Enum to dict keys
             val_loss_type = self._loss_config.val_loss
             val_loss_key_for_loss_dict = val_loss_type.value.upper()
             if val_loss_key_for_loss_dict in loss_dict:
@@ -339,7 +329,6 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
                 raise RuntimeError(
                     f"Undefined validation loss routine for {val_loss_type}"
                 )
-
         loss_dict["ESR"] = _LossItem(None, self._esr_loss(preds, targets))
         val_loss = get_val_loss()
         self.log_dict(

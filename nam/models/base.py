@@ -25,6 +25,7 @@ import torch.nn as _nn
 from .._core import InitializableFromConfig as _InitializableFromConfig
 from ..data import wav_to_tensor as _wav_to_tensor
 from .exportable import Exportable as _Exportable
+from ._abc import ImportsWeights as _ImportsWeights
 
 
 class _Base(_nn.Module, _InitializableFromConfig, _Exportable):
@@ -185,25 +186,18 @@ class BaseNet(_Base):
         super().__init__(*args, **kwargs)
         self._mps_65536_fallback = False
 
-    def forward(self, x: _torch.Tensor, pad_start: _Optional[bool] = None, **kwargs):
+    def forward(self, x, c=None, pad_start=True, **kwargs):
         pad_start = self.pad_start_default if pad_start is None else pad_start
         scalar = x.ndim == 1
         if scalar:
             x = x[None]
         if pad_start:
-            x = _torch.cat(
-                (_torch.zeros((len(x), self.receptive_field - 1)).to(x.device), x),
-                dim=1,
-            )
-        if x.shape[1] < self.receptive_field:
-            raise ValueError(
-                f"Input has {x.shape[1]} samples, which is too few for this model with "
-                f"receptive field {self.receptive_field}!"
-            )
-        y = self._forward_mps_safe(x, **kwargs)
-        if scalar:
-            y = y[0]
-        return y
+            x = self._pad_start(x)
+        # If the model supports conditioning, pass c
+        if c is not None:
+            return self._forward(x, c, **kwargs)
+        else:
+            return self._forward(x, **kwargs)
 
     def _at_nominal_settings(self, x: _torch.Tensor) -> _torch.Tensor:
         return self(x)
@@ -273,3 +267,26 @@ class BaseNet(_Base):
         d["loudness"] = self._metadata_loudness()
         d["gain"] = self._metadata_gain()
         return d
+
+    def _pad_start(self, x):
+        pad = self.receptive_field - 1
+        if pad <= 0:
+            return x
+        return _torch.cat((
+            _torch.zeros((x.shape[0], pad), device=x.device, dtype=x.dtype),
+            x
+        ), dim=1)
+
+
+class WaveNet(BaseNet, _ImportsWeights):
+    def _forward(self, x, c=None, **kwargs):
+        if x.ndim == 2:
+            x = x[:, None, :]
+        if c is not None:
+            if c.ndim == 2:
+                c = c[:, None, :]
+            y = self._net(x, c)
+        else:
+            y = self._net(x)
+        assert y.shape[1] == 1
+        return y[:, 0, :]

@@ -80,6 +80,8 @@ _apply_extensions()
 import json as _json
 from argparse import ArgumentParser as _ArgumentParser
 from pathlib import Path as _Path
+import argparse
+from nam.train.core import train
 
 from nam.train.full import main as _nam_full
 from nam.train.gui import run as nam_gui  # noqa F401 Used as an entry point
@@ -137,3 +139,33 @@ def nam_full():
         args.no_show,
         make_plots=not args.no_plots,
     )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="NAM Training CLI")
+    parser.add_argument('--dataset-type', default='default', help='Dataset type: default or json_conditioned')
+    parser.add_argument('--json-path', type=str, help='Path to JSON data file (for json_conditioned dataset)')
+    parser.add_argument('--train-path', type=str, default='output', help='Output directory for training artifacts')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--nx', type=int, default=8192, help='Receptive field size')
+    parser.add_argument('--batch-size', type=int, default=8, help='Batch size')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--lr-decay', type=float, default=0.01, help='Learning rate decay')
+    # Add other arguments as needed
+    args = parser.parse_args()
+
+    train(
+        dataset_type=args.dataset_type,
+        json_path=args.json_path,
+        train_path=args.train_path,
+        epochs=args.epochs,
+        nx=args.nx,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        lr_decay=args.lr_decay,
+        # Add other args as needed
+    )
+
+
+if __name__ == "__main__":
+    main()

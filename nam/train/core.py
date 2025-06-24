@@ -49,6 +49,7 @@ from ..util import filter_warnings as _filter_warnings
 from ._version import PROTEUS_VERSION as _PROTEUS_VERSION, Version as _Version
 from .lightning_module import LightningModule as _LightningModule
 from . import metadata as _metadata
+from nam.data import JsonConditionedDataset
 
 # Training using the simplified trainers in NAM is done at 48k.
 STANDARD_SAMPLE_RATE = 48_000.0
@@ -1023,8 +1024,6 @@ def _get_configs(
         model_config = {
             "net": {
                 "name": "WaveNet",
-                # This should do decently. If you really want a nice model, try turning up
-                # "channels" in the first block and "input_size" in the second from 12 to 16.
                 "config": get_wavenet_config(architecture),
             },
             "loss": {"val_loss": "esr"},
@@ -1317,9 +1316,9 @@ def _get_final_latency(latency_analysis: _metadata.Latency) -> int:
 
 
 def train(
-    input_path: str,
-    output_path: str,
-    train_path: str,
+    input_path: str = None,
+    output_path: str = None,
+    train_path: str = None,
     epochs=100,
     latency: _Optional[int] = None,
     model_type: str = "WaveNet",
@@ -1338,179 +1337,248 @@ def train(
     threshold_esr: _Optional[bool] = None,
     user_metadata: _Optional[_UserMetadata] = None,
     fast_dev_run: _Union[bool, int] = False,
+    dataset_type: str = "default",
+    json_path: str = None,
+    nx: int = 8192,
 ) -> _Optional[TrainOutput]:
     """
-    :param input_path: Full path to input file
-    :param output_path: Full path to output file
-    :param lr_decay: =1-gamma for Exponential learning rate decay.
-    :param threshold_esr: Stop training if ESR is better than this. Ignore if `None`.
-    :param fast_dev_run: One-step training, used for tests.
+    :param dataset_type: 'default' for standard, 'json_conditioned' for JSON-based
+    :param json_path: Path to JSON file if using json_conditioned
+    :param nx: receptive field (for json_conditioned)
     """
-
     if seed is not None:
         _torch.manual_seed(seed)
 
-    # HACK: We need to check the sample rates and lengths of the audio here or else
-    # It will look like a bad self-ESR (Issue 473)
-    # Can move this into the "v3 checks" once the others are deprecated.
-    # And honestly remake this whole thing as a data processing pipeline.
-    sample_rate_validation = _check_audio_sample_rates(input_path, output_path)
-    if not sample_rate_validation.passed:
-        raise ValueError(
-            "Different sample rates detected for input "
-            f"({sample_rate_validation.input}) and output "
-            f"({sample_rate_validation.output}) audio!"
+    # Dataset selection
+    if dataset_type == "json_conditioned":
+        dataset = JsonConditionedDataset(json_path=json_path, nx=nx, ny=ny)
+        condition_size = dataset.condition_size
+        model_config = {
+            "net": {
+                "name": "WaveNet",
+                "config": get_wavenet_config(architecture),
+            },
+            "optimizer": {"lr": lr},
+            "lr_scheduler": {"class": "ExponentialLR", "kwargs": {"gamma": 1.0 - lr_decay}},
+            "loss": {"val_loss": "esr"},
+        }
+        # Patch condition_size in all layers
+        for layer in model_config['net']['config']['layers_configs']:
+            layer['condition_size'] = condition_size
+        # Debug print to check input_size and condition_size
+        print('DEBUG: WaveNet layers_configs:', model_config['net']['config']['layers_configs'])
+        learning_config = {
+            "train_dataloader": {
+                "batch_size": batch_size,
+                "shuffle": True,
+                "pin_memory": True,
+                "drop_last": True,
+                "num_workers": 0,
+                "collate_fn": JsonConditionedDataset.collate_fn,
+            },
+            "val_dataloader": {
+                "collate_fn": JsonConditionedDataset.collate_fn,
+            },
+            "trainer": {"max_epochs": epochs},
+        }
+        n = len(dataset)
+        n_train = int(0.8 * n)
+        train_dataset = _torch.utils.data.Subset(dataset, range(n_train))
+        val_dataset = _torch.utils.data.Subset(dataset, range(n_train, n))
+        train_dataloader = _DataLoader(train_dataset, **learning_config["train_dataloader"])
+        val_dataloader = _DataLoader(val_dataset, **learning_config["val_dataloader"])
+        model = _LightningModule.init_from_config(model_config)
+        if hasattr(dataset, 'sample_rate') and dataset.sample_rate:
+            model.net.sample_rate = dataset.sample_rate
+        trainer = _pl.Trainer(
+            callbacks=get_callbacks(
+                threshold_esr,
+                user_metadata=user_metadata,
+                settings_metadata=None,
+                data_metadata=None,
+            ),
+            default_root_dir=train_path,
+            fast_dev_run=fast_dev_run,
+            **learning_config["trainer"],
         )
-    length_validation = _check_audio_lengths(input_path, output_path)
-    if not length_validation.passed:
-        raise ValueError(
-            "Your recording differs in length from the input file by "
-            f"{length_validation.delta_seconds:.2f} seconds. Check your reamp "
-            "in your DAW and ensure that they are the same length."
+        with _filter_warnings("ignore", category=_PossibleUserWarning):
+            trainer.fit(model, train_dataloader, val_dataloader)
+        # Go to best checkpoint
+        best_checkpoint = trainer.checkpoint_callback.best_model_path
+        if best_checkpoint != "":
+            model = _LightningModule.load_from_checkpoint(
+                trainer.checkpoint_callback.best_model_path,
+                **_LightningModule.parse_config(model_config),
+            )
+        model.cpu()
+        model.eval()
+        # No plotting for now
+        return TrainOutput(
+            model=model,
+            metadata=None,
         )
+    else:
+        # HACK: We need to check the sample rates and lengths of the audio here or else
+        # It will look like a bad self-ESR (Issue 473)
+        # Can move this into the "v3 checks" once the others are deprecated.
+        # And honestly remake this whole thing as a data processing pipeline.
+        sample_rate_validation = _check_audio_sample_rates(input_path, output_path)
+        if not sample_rate_validation.passed:
+            raise ValueError(
+                "Different sample rates detected for input "
+                f"({sample_rate_validation.input}) and output "
+                f"({sample_rate_validation.output}) audio!"
+            )
+        length_validation = _check_audio_lengths(input_path, output_path)
+        if not length_validation.passed:
+            raise ValueError(
+                "Your recording differs in length from the input file by "
+                f"{length_validation.delta_seconds:.2f} seconds. Check your reamp "
+                "in your DAW and ensure that they are the same length."
+            )
 
-    input_version, strong_match = _detect_input_version(input_path)
+        input_version, strong_match = _detect_input_version(input_path)
 
-    user_latency = latency
-    latency_analysis = _analyze_latency(
-        user_latency, input_version, input_path, output_path, silent=silent
-    )
-    final_latency = _get_final_latency(latency_analysis)
+        user_latency = latency
+        latency_analysis = _analyze_latency(
+            user_latency, input_version, input_path, output_path, silent=silent
+        )
+        final_latency = _get_final_latency(latency_analysis)
 
-    data_check_output = _check_data(
-        input_path, output_path, input_version, final_latency, silent
-    )
-    if data_check_output is not None:
-        if data_check_output.passed:
-            print("-Checks passed")
-        else:
-            print("Failed checks!")
-            if ignore_checks:
-                if local and not silent:
-                    _nasty_checks_modal()
-                else:
-                    _print_nasty_checks_warning()
-            elif not local:  # And not ignore_checks
-                print(
-                    "(To disable this check, run AT YOUR OWN RISK with "
-                    "`ignore_checks=True`.)"
-                )
-            if not ignore_checks:
-                print("Exiting core training...")
-                return TrainOutput(
-                    model=None,
-                    metadata=_metadata.TrainingMetadata(
-                        settings=_metadata.Settings(ignore_checks=ignore_checks),
-                        data=_metadata.Data(
-                            latency=latency_analysis, checks=data_check_output
+        data_check_output = _check_data(
+            input_path, output_path, input_version, final_latency, silent
+        )
+        if data_check_output is not None:
+            if data_check_output.passed:
+                print("-Checks passed")
+            else:
+                print("Failed checks!")
+                if ignore_checks:
+                    if local and not silent:
+                        _nasty_checks_modal()
+                    else:
+                        _print_nasty_checks_warning()
+                elif not local:  # And not ignore_checks
+                    print(
+                        "(To disable this check, run AT YOUR OWN RISK with "
+                        "`ignore_checks=True`.)"
+                    )
+                if not ignore_checks:
+                    print("Exiting core training...")
+                    return TrainOutput(
+                        model=None,
+                        metadata=_metadata.TrainingMetadata(
+                            settings=_metadata.Settings(ignore_checks=ignore_checks),
+                            data=_metadata.Data(
+                                latency=latency_analysis, checks=data_check_output
+                            ),
+                            validation_esr=None,
                         ),
-                        validation_esr=None,
-                    ),
+                    )
+
+        data_config, model_config, learning_config = _get_configs(
+            input_version,
+            input_path,
+            output_path,
+            final_latency,
+            epochs,
+            model_type,
+            architecture,
+            ny,
+            lr,
+            lr_decay,
+            batch_size,
+            fit_mrstft,
+        )
+        assert (
+            "fast_dev_run" not in learning_config
+        ), "fast_dev_run is set as a kwarg to train()"
+
+        print("Starting training. It's time to kick ass and chew bubblegum!")
+        # Issue:
+        # * Model needs sample rate from data, but data set needs nx from model.
+        # * Model is re-instantiated after training anyways.
+        # (Hacky) solution: set sample rate in model from dataloader after second
+        # instantiation from final checkpoint.
+        model = _LightningModule.init_from_config(model_config)
+        train_dataloader, val_dataloader = _get_dataloaders(
+            data_config, learning_config, model
+        )
+        if train_dataloader.dataset.sample_rate != val_dataloader.dataset.sample_rate:
+            raise RuntimeError(
+                "Train and validation data loaders have different data set sample rates: "
+                f"{train_dataloader.dataset.sample_rate}, "
+                f"{val_dataloader.dataset.sample_rate}"
+            )
+        sample_rate = train_dataloader.dataset.sample_rate
+        model.net.sample_rate = sample_rate
+
+        # Put together the metadata that's needed in checkpoints:
+        settings_metadata = _metadata.Settings(ignore_checks=ignore_checks)
+        data_metadata = _metadata.Data(latency=latency_analysis, checks=data_check_output)
+
+        trainer = _pl.Trainer(
+            callbacks=get_callbacks(
+                threshold_esr,
+                user_metadata=user_metadata,
+                settings_metadata=settings_metadata,
+                data_metadata=data_metadata,
+            ),
+            default_root_dir=train_path,
+            fast_dev_run=fast_dev_run,
+            **learning_config["trainer"],
+        )
+        # Suppress the PossibleUserWarning about num_workers (Issue 345)
+        with _filter_warnings("ignore", category=_PossibleUserWarning):
+            trainer.fit(model, train_dataloader, val_dataloader)
+
+        # Go to best checkpoint
+        best_checkpoint = trainer.checkpoint_callback.best_model_path
+        if best_checkpoint != "":
+            model = _LightningModule.load_from_checkpoint(
+                trainer.checkpoint_callback.best_model_path,
+                **_LightningModule.parse_config(model_config),
+            )
+        model.cpu()
+        model.eval()
+        model.net.sample_rate = sample_rate  # Hack, part 2
+
+        def window_kwargs(version: _Version):
+            if version.major == 1:
+                return dict(
+                    window_start=100_000,  # Start of the plotting window, in samples
+                    window_end=101_000,  # End of the plotting window, in samples
                 )
-
-    data_config, model_config, learning_config = _get_configs(
-        input_version,
-        input_path,
-        output_path,
-        final_latency,
-        epochs,
-        model_type,
-        Architecture(architecture),
-        ny,
-        lr,
-        lr_decay,
-        batch_size,
-        fit_mrstft,
-    )
-    assert (
-        "fast_dev_run" not in learning_config
-    ), "fast_dev_run is set as a kwarg to train()"
-
-    print("Starting training. It's time to kick ass and chew bubblegum!")
-    # Issue:
-    # * Model needs sample rate from data, but data set needs nx from model.
-    # * Model is re-instantiated after training anyways.
-    # (Hacky) solution: set sample rate in model from dataloader after second
-    # instantiation from final checkpoint.
-    model = _LightningModule.init_from_config(model_config)
-    train_dataloader, val_dataloader = _get_dataloaders(
-        data_config, learning_config, model
-    )
-    if train_dataloader.dataset.sample_rate != val_dataloader.dataset.sample_rate:
-        raise RuntimeError(
-            "Train and validation data loaders have different data set sample rates: "
-            f"{train_dataloader.dataset.sample_rate}, "
-            f"{val_dataloader.dataset.sample_rate}"
-        )
-    sample_rate = train_dataloader.dataset.sample_rate
-    model.net.sample_rate = sample_rate
-
-    # Put together the metadata that's needed in checkpoints:
-    settings_metadata = _metadata.Settings(ignore_checks=ignore_checks)
-    data_metadata = _metadata.Data(latency=latency_analysis, checks=data_check_output)
-
-    trainer = _pl.Trainer(
-        callbacks=get_callbacks(
-            threshold_esr,
-            user_metadata=user_metadata,
-            settings_metadata=settings_metadata,
-            data_metadata=data_metadata,
-        ),
-        default_root_dir=train_path,
-        fast_dev_run=fast_dev_run,
-        **learning_config["trainer"],
-    )
-    # Suppress the PossibleUserWarning about num_workers (Issue 345)
-    with _filter_warnings("ignore", category=_PossibleUserWarning):
-        trainer.fit(model, train_dataloader, val_dataloader)
-
-    # Go to best checkpoint
-    best_checkpoint = trainer.checkpoint_callback.best_model_path
-    if best_checkpoint != "":
-        model = _LightningModule.load_from_checkpoint(
-            trainer.checkpoint_callback.best_model_path,
-            **_LightningModule.parse_config(model_config),
-        )
-    model.cpu()
-    model.eval()
-    model.net.sample_rate = sample_rate  # Hack, part 2
-
-    def window_kwargs(version: _Version):
-        if version.major == 1:
+            elif version.major == 2:
+                # Same validation set even though it's a different spot in the reamp file
+                return dict(
+                    window_start=100_000,  # Start of the plotting window, in samples
+                    window_end=101_000,  # End of the plotting window, in samples
+                )
+            # Fallback:
             return dict(
                 window_start=100_000,  # Start of the plotting window, in samples
                 window_end=101_000,  # End of the plotting window, in samples
             )
-        elif version.major == 2:
-            # Same validation set even though it's a different spot in the reamp file
-            return dict(
-                window_start=100_000,  # Start of the plotting window, in samples
-                window_end=101_000,  # End of the plotting window, in samples
-            )
-        # Fallback:
-        return dict(
-            window_start=100_000,  # Start of the plotting window, in samples
-            window_end=101_000,  # End of the plotting window, in samples
-        )
 
-    validation_esr = _plot(
-        model,
-        val_dataloader.dataset,
-        filepath=train_path + "/" + modelname if save_plot else None,
-        silent=silent,
-        **window_kwargs(input_version),
-    )
-    for dl in (train_dataloader, val_dataloader):
-        assert isinstance(dl.dataset, _AbstractDataset)
-        dl.dataset.teardown()
-    return TrainOutput(
-        model=model,
-        metadata=_metadata.TrainingMetadata(
-            settings=settings_metadata,
-            data=data_metadata,
-            validation_esr=validation_esr,
-        ),
-    )
+        validation_esr = _plot(
+            model,
+            val_dataloader.dataset,
+            filepath=train_path + "/" + modelname if save_plot else None,
+            silent=silent,
+            **window_kwargs(input_version),
+        )
+        for dl in (train_dataloader, val_dataloader):
+            assert isinstance(dl.dataset, _AbstractDataset)
+            dl.dataset.teardown()
+        return TrainOutput(
+            model=model,
+            metadata=_metadata.TrainingMetadata(
+                settings=settings_metadata,
+                data=data_metadata,
+                validation_esr=validation_esr,
+            ),
+        )
 
 
 class DataInputValidation(_BaseModel):
@@ -1531,10 +1599,6 @@ def validate_input(input_path) -> DataInputValidation:
 
 
 class _PyTorchDataSplitValidation(_BaseModel):
-    """
-    :param msg: On exception, catch and assign. Otherwise None
-    """
-
     passed: bool
     msg: _Optional[str]
 

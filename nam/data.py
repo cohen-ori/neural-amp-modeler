@@ -28,6 +28,7 @@ import torch as _torch
 import wavio as _wavio
 from torch.utils.data import Dataset as _Dataset
 from tqdm import tqdm as _tqdm
+import json as _json
 
 from ._core import (
     InitializableFromConfig as _InitializableFromConfig,
@@ -794,3 +795,70 @@ def init_dataset(config, split: Split) -> AbstractDataset:
                 "dataset_configs": [{**common, **c} for c in base_config],
             }
         )
+
+
+class JsonConditionedDataset(AbstractDataset, _InitializableFromConfig):
+    """
+    Dataset that loads input/output pairs and knob conditioning from a JSON file.
+    Each entry in the JSON should have:
+        - input_path: path to input wav
+        - output_path: path to output wav
+        - knob_type: string (e.g., 'gain', 'bass', ...)
+        - knob_level: float (0.0-1.0)
+    The knob mapping and condition_size are built dynamically.
+    """
+    def __init__(
+        self,
+        json_path: str,
+        nx: int,
+        ny: int = 1,
+        sample_rate: _Optional[float] = None,
+        **kwargs
+    ):
+        super().__init__()
+        with open(json_path, 'r') as f:
+            self.entries = _json.load(f)
+        # Build knob mapping
+        self.knob_types = sorted({entry['knob_type'] for entry in self.entries})
+        self.knob_map = {k: i for i, k in enumerate(self.knob_types)}
+        self.condition_size = len(self.knob_types) + 1
+        self.nx = nx
+        self.ny = ny
+        self.sample_rate = sample_rate
+        self._kwargs = kwargs
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, idx):
+        entry = self.entries[idx]
+        x = wav_to_tensor(entry['input_path'], rate=self.sample_rate).flatten()
+        y = wav_to_tensor(entry['output_path'], rate=self.sample_rate).flatten()
+        # Build condition vector: one-hot for knob type + knob level
+        cond = _torch.zeros(self.condition_size, dtype=_torch.float32)
+        cond[self.knob_map[entry['knob_type']]] = 1.0
+        cond[-1] = float(entry['knob_level'])
+        # Random windowing for training
+        if len(x) < self.nx + self.ny - 1:
+            raise ValueError(f"Input too short: {len(x)} < nx+ny-1={self.nx + self.ny - 1}")
+        # Pick a random start index for the window
+        start = _np.random.randint(0, len(x) - (self.nx + self.ny - 1) + 1)
+        x_win = x[start : start + self.nx]
+        y_win = y[start + self.nx - self.ny : start + self.nx]
+        return x_win, y_win, cond
+
+    @classmethod
+    def parse_config(cls, config):
+        # config should have 'json_path', 'nx', 'ny', 'sample_rate' (optional)
+        return cls(**config)
+
+    @staticmethod
+    def collate_fn(batch):
+        xs, ys, conds = zip(*batch)
+        xs = _torch.stack(xs, dim=0)  # (B, nx)
+        ys = _torch.stack(ys, dim=0)  # (B, ny)
+        conds = _torch.stack(conds, dim=0)  # (B, condition_size)
+        return xs, ys, conds
+
+# Register the new dataset
+register_dataset_initializer("json_conditioned", JsonConditionedDataset.parse_config)
